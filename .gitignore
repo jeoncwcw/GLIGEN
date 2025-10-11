@@ -1,0 +1,20 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+env/
+
+# Editor settings
+.vscode/
+*.code-workspace
+
+# Model checkpoints and generated artifacts
+gligen_checkpoints/
+generation_samples/
+inference_images/
+*.ckpt
+*.pth
+*.pt
