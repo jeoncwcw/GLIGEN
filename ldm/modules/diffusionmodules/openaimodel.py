@@ -17,6 +17,7 @@ from ldm.modules.diffusionmodules.util import (
     timestep_embedding,
 )
 from ldm.modules.attention import SpatialTransformer
+from ldm.modules.self_attention_sharing import SelfAttentionSharingController
 # from .positionnet  import PositionNet
 from torch.utils import checkpoint
 from ldm.util import instantiate_from_config
@@ -397,6 +398,43 @@ class UNetModel(nn.Module):
         self.position_net = instantiate_from_config(grounding_tokenizer) 
         
 
+    def _maybe_compute_tv_mask(self, grounding_input, height, width):
+        if grounding_input is None:
+            return None
+
+        boxes = grounding_input.get("boxes")
+        masks = grounding_input.get("masks")
+        if boxes is None or masks is None:
+            return None
+
+        B, N, _ = boxes.shape
+        device = boxes.device
+        blob = boxes.new_zeros((B, N, height, width))
+        valid = masks > 0.5
+
+        for b in range(B):
+            for n in range(N):
+                if not valid[b, n]:
+                    continue
+                x0, y0, x1, y1 = boxes[b, n]
+                if x1 <= x0 or y1 <= y0:
+                    continue
+
+                x0_idx = int(th.clamp(th.floor(x0 * width), 0, width - 1).item())
+                x1_idx = int(th.clamp(th.ceil(x1 * width), 0, width).item())
+                y0_idx = int(th.clamp(th.floor(y0 * height), 0, height - 1).item())
+                y1_idx = int(th.clamp(th.ceil(y1 * height), 0, height).item())
+
+                if x1_idx <= x0_idx:
+                    x1_idx = min(x0_idx + 1, width)
+                if y1_idx <= y0_idx:
+                    y1_idx = min(y0_idx + 1, height)
+
+                blob[b, n, y0_idx:y1_idx, x0_idx:x1_idx] = 1.0
+
+        return {"blob": blob, "cache": {}}
+
+
     def restore_first_conv_from_SD(self):
         if self.first_conv_restorable:
             device = self.input_blocks[0][0].weight.device
@@ -462,6 +500,29 @@ class UNetModel(nn.Module):
             h = module(h, emb, context, objs, tv_mask)
 
         return self.out(h)
+
+
+    def forward_with_shared_self_attention(
+        self,
+        source_input,
+        target_input,
+        source_tv_mask=None,
+        target_tv_mask=None,
+        detach_shared=True,
+    ):
+        controller = SelfAttentionSharingController(self, detach_shared=detach_shared)
+
+        controller.enable_recording(detach=detach_shared)
+        source_output = self.forward(source_input, tv_mask=source_tv_mask)
+        caches = controller.collect_caches()
+
+        controller.apply_caches(caches, detach=detach_shared)
+        try:
+            target_output = self.forward(target_input, tv_mask=target_tv_mask)
+        finally:
+            controller.clear_overrides()
+
+        return source_output, target_output
 
 
 

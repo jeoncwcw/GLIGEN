@@ -57,13 +57,13 @@ class DDIMSampler(object):
 
 
     @torch.no_grad()
-    def sample(self, S, shape, input, uc=None, guidance_scale=1, mask=None, x0=None):
+    def sample(self, S, shape, input, uc=None, guidance_scale=1, mask=None, x0=None, share_self_attention=False):
         self.make_schedule(ddim_num_steps=S)
-        return self.ddim_sampling(shape, input, uc, guidance_scale,  mask=mask, x0=x0)
+        return self.ddim_sampling(shape, input, uc, guidance_scale,  mask=mask, x0=x0, share_self_attention=share_self_attention)
  
 
     @torch.no_grad()
-    def ddim_sampling(self, shape, input, uc, guidance_scale=1, mask=None, x0=None):
+    def ddim_sampling(self, shape, input, uc, guidance_scale=1, mask=None, x0=None, share_self_attention=False):
         b = shape[0]
         
         img = input["x"]
@@ -100,21 +100,64 @@ class DDIMSampler(object):
                 img = img_orig * mask + (1. - mask) * img
                 input["x"] = img
             
-            img, pred_x0 = self.p_sample_ddim(input, index=index, uc=uc, guidance_scale=guidance_scale)
+            img, pred_x0 = self.p_sample_ddim(
+                input,
+                index=index,
+                uc=uc,
+                guidance_scale=guidance_scale,
+                share_self_attention=share_self_attention,
+            )
             input["x"] = img 
 
         return img
 
 
     @torch.no_grad()
-    def p_sample_ddim(self, input, index, uc=None, guidance_scale=1):
+    def p_sample_ddim(self, input, index, uc=None, guidance_scale=1, share_self_attention=False):
 
+        use_sharing = (
+            share_self_attention
+            and uc is not None
+            and guidance_scale != 1
+            and hasattr(self.model, "forward_with_shared_self_attention")
+        )
 
-        e_t = self.model(input) 
-        if uc is not None and guidance_scale != 1:
-            unconditional_input = dict(x=input["x"], timesteps=input["timesteps"], context=uc, inpainting_extra_input=input["inpainting_extra_input"], grounding_extra_input=input['grounding_extra_input'])
-            e_t_uncond = self.model( unconditional_input ) 
-            e_t = e_t_uncond + guidance_scale * (e_t - e_t_uncond)
+        if use_sharing:
+            conditional_input = dict(
+                x=input["x"],
+                timesteps=input["timesteps"],
+                context=input["context"],
+                grounding_input=input.get("grounding_input"),
+                inpainting_extra_input=input.get("inpainting_extra_input"),
+                grounding_extra_input=input.get("grounding_extra_input"),
+            )
+            unconditional_input = dict(
+                x=input["x"],
+                timesteps=input["timesteps"],
+                context=uc,
+                inpainting_extra_input=input.get("inpainting_extra_input"),
+                grounding_extra_input=input.get("grounding_extra_input"),
+            )
+            e_uncond, e_cond = self.model.forward_with_shared_self_attention(
+                source_input=unconditional_input,
+                target_input=conditional_input,
+                source_tv_mask=input.get("tv_mask"),
+                target_tv_mask=input.get("tv_mask"),
+                detach_shared=True,
+            )
+            e_t = e_uncond + guidance_scale * (e_cond - e_uncond)
+        else:
+            e_t = self.model(input)
+            if uc is not None and guidance_scale != 1:
+                unconditional_input = dict(
+                    x=input["x"],
+                    timesteps=input["timesteps"],
+                    context=uc,
+                    inpainting_extra_input=input["inpainting_extra_input"],
+                    grounding_extra_input=input['grounding_extra_input']
+                )
+                e_t_uncond = self.model(unconditional_input)
+                e_t = e_t_uncond + guidance_scale * (e_t - e_t_uncond)
 
         # select parameters corresponding to the currently considered timestep
         b = input["x"].shape[0] 

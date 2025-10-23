@@ -57,13 +57,13 @@ class PLMSSampler(object):
 
 
     @torch.no_grad()
-    def sample(self, S, shape, input, uc=None, guidance_scale=1, mask=None, x0=None):
+    def sample(self, S, shape, input, uc=None, guidance_scale=1, mask=None, x0=None, share_self_attention=False):
         self.make_schedule(ddim_num_steps=S)
-        return self.plms_sampling(shape, input, uc, guidance_scale, mask=mask, x0=x0)
+        return self.plms_sampling(shape, input, uc, guidance_scale, mask=mask, x0=x0, share_self_attention=share_self_attention)
 
 
     @torch.no_grad()
-    def plms_sampling(self, shape, input, uc=None, guidance_scale=1, mask=None, x0=None):
+    def plms_sampling(self, shape, input, uc=None, guidance_scale=1, mask=None, x0=None, share_self_attention=False):
 
         b = shape[0]
         
@@ -99,7 +99,16 @@ class PLMSSampler(object):
                 img = img_orig * mask + (1. - mask) * img
                 input["x"] = img
 
-            img, pred_x0, e_t = self.p_sample_plms(input, ts, index=index, uc=uc, guidance_scale=guidance_scale, old_eps=old_eps, t_next=ts_next)
+            img, pred_x0, e_t = self.p_sample_plms(
+                input,
+                ts,
+                index=index,
+                uc=uc,
+                guidance_scale=guidance_scale,
+                old_eps=old_eps,
+                t_next=ts_next,
+                share_self_attention=share_self_attention,
+            )
             input["x"] = img
             old_eps.append(e_t)
             if len(old_eps) >= 4:
@@ -109,15 +118,54 @@ class PLMSSampler(object):
 
 
     @torch.no_grad()
-    def p_sample_plms(self, input, t, index, guidance_scale=1., uc=None, old_eps=None, t_next=None):
+    def p_sample_plms(self, input, t, index, guidance_scale=1., uc=None, old_eps=None, t_next=None, share_self_attention=False):
         x = deepcopy(input["x"]) 
         b = x.shape[0]
 
         def get_model_output(input):
-            e_t = self.model(input) 
+            use_sharing = (
+                share_self_attention
+                and uc is not None
+                and guidance_scale != 1
+                and hasattr(self.model, "forward_with_shared_self_attention")
+            )
+
+            if use_sharing:
+                conditional_input = dict(
+                    x=input["x"],
+                    timesteps=input["timesteps"],
+                    context=input["context"],
+                    grounding_input=input.get("grounding_input"),
+                    inpainting_extra_input=input.get("inpainting_extra_input"),
+                    grounding_extra_input=input.get("grounding_extra_input"),
+                )
+                unconditional_input = dict(
+                    x=input["x"],
+                    timesteps=input["timesteps"],
+                    context=uc,
+                    inpainting_extra_input=input.get("inpainting_extra_input"),
+                    grounding_extra_input=input.get("grounding_extra_input"),
+                )
+
+                e_uncond, e_cond = self.model.forward_with_shared_self_attention(
+                    source_input=unconditional_input,
+                    target_input=conditional_input,
+                    source_tv_mask=input.get("tv_mask"),
+                    target_tv_mask=input.get("tv_mask"),
+                    detach_shared=True,
+                )
+                return e_uncond + guidance_scale * (e_cond - e_uncond)
+
+            e_t = self.model(input)
             if uc is not None and guidance_scale != 1:
-                unconditional_input = dict(x=input["x"], timesteps=input["timesteps"], context=uc, inpainting_extra_input=input["inpainting_extra_input"], grounding_extra_input=input['grounding_extra_input'])
-                e_t_uncond = self.model( unconditional_input ) 
+                unconditional_input = dict(
+                    x=input["x"],
+                    timesteps=input["timesteps"],
+                    context=uc,
+                    inpainting_extra_input=input["inpainting_extra_input"],
+                    grounding_extra_input=input['grounding_extra_input']
+                )
+                e_t_uncond = self.model(unconditional_input)
                 e_t = e_t_uncond + guidance_scale * (e_t - e_t_uncond)
             return e_t
 

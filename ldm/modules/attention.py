@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from torch import nn, einsum
 from einops import rearrange, repeat
 
+from ldm.util import prepare_tv_mask
+
 # from ldm.modules.diffusionmodules.util import checkpoint, FourierEmbedder
 from torch.utils import checkpoint
 
@@ -31,6 +33,24 @@ def init_(tensor):
     std = 1 / math.sqrt(dim)
     tensor.uniform_(-std, std)
     return tensor
+
+
+def resolve_tv_mask(tv_mask, n_visual_tokens, device):
+    if tv_mask is None:
+        return None
+
+    if isinstance(tv_mask, dict):
+        blob = tv_mask.get("blob")
+        if blob is None:
+            return None
+        cache = tv_mask.setdefault("cache", {})
+        size = int(math.sqrt(n_visual_tokens))
+        key = size
+        if key not in cache:
+            cache[key] = prepare_tv_mask(blob, size, size)
+        return cache[key].to(device)
+
+    return tv_mask.to(device)
 
 
 # feedforward
@@ -164,10 +184,64 @@ class SelfAttention(nn.Module):
 
         self.to_out = nn.Sequential(nn.Linear(inner_dim, query_dim), nn.Dropout(dropout) )
 
+        # Flags used for self-attention sharing across different forward passes.
+        self._record_kv = False
+        self._record_detach = True
+        self._cached_k = None
+        self._cached_v = None
+        self._kv_override = None
+
+    def enable_kv_recording(self, detach=True):
+        """Stores the computed key/value tensors during the next forward pass."""
+        self._record_kv = True
+        self._record_detach = detach
+        self._cached_k = None
+        self._cached_v = None
+
+    def disable_kv_recording(self, clear_cache=False):
+        self._record_kv = False
+        if clear_cache:
+            self.clear_kv_cache()
+
+    def get_kv_cache(self):
+        if self._cached_k is None or self._cached_v is None:
+            return None
+        return self._cached_k, self._cached_v
+
+    def clear_kv_cache(self):
+        self._cached_k = None
+        self._cached_v = None
+
+    def set_kv_override(self, cache, detach=True):
+        if cache is None:
+            self._kv_override = None
+            return
+        k, v = cache
+        if detach:
+            k = k.detach().clone()
+            v = v.detach().clone()
+        self._kv_override = (k, v)
+
+    def clear_kv_override(self):
+        self._kv_override = None
+        self.clear_kv_cache()
+
     def forward(self, x, attn_mask=None):
         q = self.to_q(x) # B*N*(H*C)
-        k = self.to_k(x) # B*N*(H*C)
-        v = self.to_v(x) # B*N*(H*C)
+
+        if self._kv_override is not None:
+            k, v = self._kv_override
+        else:
+            k = self.to_k(x) # B*N*(H*C)
+            v = self.to_v(x) # B*N*(H*C)
+            if self._record_kv:
+                if self._record_detach:
+                    self._cached_k = k.detach().clone()
+                    self._cached_v = v.detach().clone()
+                else:
+                    self._cached_k = k
+                    self._cached_v = v
+                self._record_kv = False
 
         B, N, HC = q.shape 
         H = self.heads
@@ -252,12 +326,14 @@ class GatedSelfAttentionDense(nn.Module):
         tokens = torch.cat([x,objs],dim=1)  # (B, N_visual + N_text, D)
         
         full_mask = None
-        if tv_mask is not None:
-            # tv_mask: (B, N_text, N_visual) boolean (True=allow)
-            N_text = objs.shape[1]
-            N_total = N_visual + N_text
-            full_mask = torch.ones(B, N_total, N_total, dtype=torch.bool, device=tokens.device)
-            full_mask = full_mask[:, N_visual:, :N_visual] = tv_mask.bool()
+        resolved_mask = resolve_tv_mask(tv_mask, N_visual, tokens.device)
+        if resolved_mask is not None:
+            N_text = tokens.shape[1] - N_visual
+            if resolved_mask.shape[0] == B and resolved_mask.shape[1] == N_text and resolved_mask.shape[2] == N_visual:
+                full_mask = torch.ones(B, N_visual + N_text, N_visual + N_text, dtype=torch.bool, device=tokens.device)
+                full_mask[:, N_visual:, :N_visual] = resolved_mask.bool()
+            else:
+                full_mask = None
             
         out = self.attn(self.norm1(tokens), attn_mask=full_mask)
         out_vis = out[:, :N_visual, :]
@@ -293,7 +369,7 @@ class GatedSelfAttentionDense2(nn.Module):
         self.scale = 1  
 
 
-    def forward(self, x, objs):
+    def forward(self, x, objs, tv_mask=None):
 
         B, N_visual, _ = x.shape
         B, N_ground, _ = objs.shape
@@ -312,11 +388,14 @@ class GatedSelfAttentionDense2(nn.Module):
         tokens = torch.cat([x, objs], dim=1)
 
         full_mask = None
-        if tv_mask is not None:
-            # tv_mask: (B, N_text, N_visual) boolean
-            N_total = N_visual + N_text
-            full_mask = torch.ones(B, N_total, N_total, dtype=torch.bool, device=tokens.device)
-            full_mask[:, N_visual:, :N_visual] = tv_mask.bool()
+        resolved_mask = resolve_tv_mask(tv_mask, N_visual, tokens.device)
+        if resolved_mask is not None:
+            N_text = objs.shape[1]
+            if resolved_mask.shape[0] == B and resolved_mask.shape[1] == N_text and resolved_mask.shape[2] == N_visual:
+                full_mask = torch.ones(B, N_visual + N_text, N_visual + N_text, dtype=torch.bool, device=tokens.device)
+                full_mask[:, N_visual:, :N_visual] = resolved_mask.bool()
+            else:
+                full_mask = None
 
         # select grounding token and resize it to visual token size as residual 
         out = self.attn(self.norm1(tokens), attn_mask=full_mask)[:, N_visual:, :]  # objs 위치의 출력
@@ -357,14 +436,14 @@ class BasicTransformerBlock(nn.Module):
             assert False 
 
 
-    def forward(self, x, context, objs):
+    def forward(self, x, context, objs, tv_mask=None):
 #        return checkpoint(self._forward, (x, context, objs), self.parameters(), self.use_checkpoint)
         if self.use_checkpoint and x.requires_grad:
             return checkpoint.checkpoint(self._forward, x, context, objs, tv_mask)
         else:
             return self._forward(x, context, objs, tv_mask)
 
-    def _forward(self, x, context, objs): 
+    def _forward(self, x, context, objs, tv_mask=None): 
         x = self.attn1( self.norm1(x) ) + x 
         x = self.fuser(x, objs, tv_mask) # identity mapping in the beginning 
         x = self.attn2(self.norm2(x), context, context) + x

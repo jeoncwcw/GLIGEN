@@ -382,6 +382,8 @@ def run(meta, config, starting_noise=None):
 
     # - - - - - sampler - - - - - # 
     alpha_generator_func = partial(alpha_generator, type=meta.get("alpha_type"))
+    share_self_attention = bool(config.get("share_self_attention", False))
+
     if config.no_plms:
         sampler = DDIMSampler(diffusion, model, alpha_generator_func=alpha_generator_func, set_alpha_scale=set_alpha_scale)
         steps = 250 
@@ -427,7 +429,16 @@ def run(meta, config, starting_noise=None):
     # - - - - - start sampling - - - - - #
     shape = (config.batch_size, model.in_channels, model.image_size, model.image_size)
 
-    samples_fake = sampler.sample(S=steps, shape=shape, input=input,  uc=uc, guidance_scale=config.guidance_scale, mask=inpainting_mask, x0=z0)
+    samples_fake = sampler.sample(
+        S=steps,
+        shape=shape,
+        input=input,
+        uc=uc,
+        guidance_scale=config.guidance_scale,
+        mask=inpainting_mask,
+        x0=z0,
+        share_self_attention=share_self_attention,
+    )
     samples_fake = autoencoder.decode(samples_fake)
 
 
@@ -459,6 +470,7 @@ if __name__ == "__main__":
     parser.add_argument("--no_plms", action='store_true', help="use DDIM instead. WARNING: I did not test the code yet")
     parser.add_argument("--guidance_scale", type=float,  default=7.5, help="")
     parser.add_argument("--negative_prompt", type=str,  default='longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality', help="")
+    parser.add_argument("--share_self_attention", action='store_true', help="reuse unconditional self-attention activations when classifier-free guidance is enabled")
     #parser.add_argument("--negative_prompt", type=str,  default=None, help="")
     args = parser.parse_args()
     
